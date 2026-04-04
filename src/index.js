@@ -1,7 +1,7 @@
 /**
  * BananaHub API — Cloudflare Worker
  *
- * Install-count tracking for the BananaHub template ecosystem.
+ * Install and usage tracking for the BananaHub template ecosystem.
  * Uses Workers KV (namespace binding: INSTALLS) to persist counters.
  *
  * KV key schema
@@ -9,6 +9,10 @@
  *   count:{repo}:{template_id}        per-template total   (no TTL)
  *   repo-count:{repo}                 repo-level aggregate (no TTL)
  *   daily:{YYYY-MM-DD}:{repo}:{template_id}   trending    (TTL 7d)
+ *   usage-count:{event}:{repo}:{template_id}          usage total          (no TTL)
+ *   usage-daily:{YYYY-MM-DD}:{event}:{repo}:{template_id}   usage 24h      (TTL 7d)
+ *   usage-unique:{event}:{repo}:{template_id}:{anon}  unique marker        (no TTL)
+ *   usage-unique-count:{event}:{repo}:{template_id}   usage unique total   (no TTL)
  *   discovered:{repo}:{template_id}   discovered candidate metadata (no TTL)
  *   ratelimit:{ip}:{minute}           rate-limit counter   (TTL 120s)
  */
@@ -22,6 +26,13 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
+const KNOWN_SHORT_INSTALL_ROOTS = new Set(["references/templates", "templates"]);
+const CANONICAL_REPO_ALIASES = new Map([
+  ["nano-banana-hub/nanobanana", "bananahub-ai/bananahub-skill"],
+]);
+const VALID_USAGE_EVENTS = new Set(["selected", "generate_success", "edit_success"]);
+const VALID_TEMPLATE_DISTRIBUTIONS = new Set(["bundled", "remote"]);
+const VALID_CATALOG_SOURCES = new Set(["curated", "discovered"]);
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -57,8 +68,151 @@ function normalizeOptionalString(value) {
   return value.trim().replace(/^\/+|\/+$/g, "");
 }
 
+function normalizeRepo(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.trim();
+}
+
+function canonicalizeRepo(value) {
+  const repo = normalizeRepo(value);
+  if (!repo) {
+    return "";
+  }
+
+  return CANONICAL_REPO_ALIASES.get(repo.toLowerCase()) || repo;
+}
+
+function repoKeyVariants(value) {
+  const canonicalRepo = canonicalizeRepo(value);
+  const variants = new Set([canonicalRepo]);
+
+  for (const [alias, canonical] of CANONICAL_REPO_ALIASES.entries()) {
+    if (canonical.toLowerCase() === canonicalRepo.toLowerCase()) {
+      variants.add(alias);
+    }
+  }
+
+  return Array.from(variants).filter(Boolean);
+}
+
+function rewriteRepoPrefix(value, fromRepo, toRepo) {
+  const input = normalizeRepo(value);
+  if (!input) {
+    return input;
+  }
+
+  if (input === fromRepo) {
+    return toRepo;
+  }
+
+  if (input.startsWith(`${fromRepo}/`)) {
+    return `${toRepo}${input.slice(fromRepo.length)}`;
+  }
+
+  return input;
+}
+
+function normalizeOfficialInstallTarget(repo, installTarget) {
+  const normalizedTarget = normalizeOptionalString(installTarget);
+  const repoPrefix = `${repo}/`;
+  if (!normalizedTarget.startsWith(repoPrefix)) {
+    return normalizedTarget;
+  }
+
+  const tail = normalizeOptionalString(normalizedTarget.slice(repoPrefix.length));
+  for (const root of KNOWN_SHORT_INSTALL_ROOTS) {
+    const prefix = `${root}/`;
+    if (tail.startsWith(prefix)) {
+      return `${repo}/${tail.slice(prefix.length)}`;
+    }
+  }
+
+  return normalizedTarget;
+}
+
+function normalizeDiscoveredCandidate(candidate) {
+  const originalRepo = normalizeRepo(candidate?.repo);
+  const canonicalRepo = canonicalizeRepo(originalRepo);
+  const normalized = {
+    ...candidate,
+    repo: canonicalRepo,
+  };
+
+  if (canonicalRepo !== originalRepo) {
+    normalized.install_target = normalizeOfficialInstallTarget(
+      canonicalRepo,
+      rewriteRepoPrefix(candidate?.install_target, originalRepo, canonicalRepo)
+    );
+  } else {
+    normalized.install_target = normalizeOptionalString(candidate?.install_target);
+  }
+
+  normalized.template_path = normalizeOptionalString(candidate?.template_path);
+  return normalized;
+}
+
+function mergeDiscoveredCandidates(left, right) {
+  const firstSeenCandidates = [left?.first_seen_at, right?.first_seen_at].filter(Boolean).sort();
+  const lastSeenCandidates = [left?.last_seen_at, right?.last_seen_at].filter(Boolean).sort().reverse();
+  const latestRecord = [left, right]
+    .filter(Boolean)
+    .sort((a, b) => String(b.last_seen_at || "").localeCompare(String(a.last_seen_at || "")))[0] || null;
+
+  return {
+    ...left,
+    ...right,
+    repo: left.repo || right.repo,
+    template_id: left.template_id || right.template_id,
+    template_path: left.template_path || right.template_path || "",
+    install_target: left.install_target || right.install_target || "",
+    first_seen_at: firstSeenCandidates[0] || "",
+    last_seen_at: lastSeenCandidates[0] || "",
+    install_events: (left.install_events || 0) + (right.install_events || 0),
+    latest_cli_version: latestRecord?.latest_cli_version || left.latest_cli_version || right.latest_cli_version || "",
+  };
+}
+
+function normalizeUsageEvent(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  const normalized = value.trim().toLowerCase();
+  return VALID_USAGE_EVENTS.has(normalized) ? normalized : "";
+}
+
+function normalizeEnum(value, allowedValues) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  const normalized = value.trim().toLowerCase();
+  return allowedValues.has(normalized) ? normalized : "";
+}
+
+function normalizeAnonymousId(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  const normalized = value.trim();
+  if (!normalized || normalized.length > 128) {
+    return "";
+  }
+
+  return /^[A-Za-z0-9_-]+$/.test(normalized) ? normalized : "";
+}
+
+function parseCount(rawValue) {
+  return rawValue ? parseInt(rawValue, 10) : 0;
+}
+
 async function upsertDiscoveredCandidate(env, body, repo, templateId) {
-  const key = `discovered:${repo}:${templateId}`;
+  const canonicalRepo = canonicalizeRepo(repo);
+  const key = `discovered:${canonicalRepo}:${templateId}`;
   const now = new Date().toISOString();
 
   let existing = null;
@@ -70,11 +224,16 @@ async function upsertDiscoveredCandidate(env, body, repo, templateId) {
   }
 
   const templatePath = normalizeOptionalString(body.template_path);
-  const installTarget = typeof body.install_target === "string" ? body.install_target.trim() : "";
+  const installTarget = normalizeOfficialInstallTarget(
+    canonicalRepo,
+    typeof body.install_target === "string"
+      ? rewriteRepoPrefix(body.install_target, repo, canonicalRepo)
+      : ""
+  );
   const cliVersion = typeof body.cli_version === "string" ? body.cli_version.trim() : "";
 
   const candidate = {
-    repo,
+    repo: canonicalRepo,
     template_id: templateId,
     template_path: templatePath || existing?.template_path || "",
     install_target: installTarget || existing?.install_target || "",
@@ -90,6 +249,61 @@ async function upsertDiscoveredCandidate(env, body, repo, templateId) {
   }
 
   await env.INSTALLS.put(key, JSON.stringify(candidate));
+}
+
+async function incrementCounter(env, key, delta = 1, options) {
+  const rawValue = await env.INSTALLS.get(key);
+  const nextValue = parseCount(rawValue) + delta;
+  await env.INSTALLS.put(key, String(nextValue), options);
+  return nextValue;
+}
+
+async function readUsageStats(env, repo, templateId) {
+  const events = ["selected", "generate_success", "edit_success"];
+  const today = todayUTC();
+  const keys = [];
+  const canonicalRepo = canonicalizeRepo(repo);
+  const variants = repoKeyVariants(canonicalRepo);
+
+  for (const repoVariant of variants) {
+    for (const event of events) {
+      keys.push(`usage-count:${event}:${repoVariant}:${templateId}`);
+      keys.push(`usage-unique-count:${event}:${repoVariant}:${templateId}`);
+      keys.push(`usage-daily:${today}:${event}:${repoVariant}:${templateId}`);
+    }
+  }
+
+  const values = await Promise.all(keys.map((key) => env.INSTALLS.get(key)));
+  const stats = {};
+
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index];
+    stats[event] = {
+      total: 0,
+      unique: 0,
+      last_24h: 0,
+    };
+  }
+
+  let offset = 0;
+  for (const _repoVariant of variants) {
+    for (const event of events) {
+      stats[event].total += parseCount(values[offset]);
+      stats[event].unique += parseCount(values[offset + 1]);
+      stats[event].last_24h += parseCount(values[offset + 2]);
+      offset += 3;
+    }
+  }
+
+  return {
+    repo: canonicalRepo,
+    template_id: templateId,
+    selected: stats.selected,
+    generate_success: stats.generate_success,
+    edit_success: stats.edit_success,
+    success_total: stats.generate_success.total + stats.edit_success.total,
+    success_24h: stats.generate_success.last_24h + stats.edit_success.last_24h,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -111,12 +325,13 @@ async function handleInstalls(request, env) {
     return json({ error: "invalid_json" }, 400);
   }
 
-  const { repo, template_id } = body;
+  const repo = canonicalizeRepo(body.repo);
+  const template_id = typeof body.template_id === "string" ? body.template_id.trim() : "";
 
-  if (!repo || typeof repo !== "string" || !repo.includes("/")) {
+  if (!repo || !repo.includes("/")) {
     return json({ error: "invalid_repo", message: "repo is required and must contain '/'" }, 400);
   }
-  if (!template_id || typeof template_id !== "string") {
+  if (!template_id) {
     return json({ error: "invalid_template_id", message: "template_id is required" }, 400);
   }
 
@@ -161,32 +376,125 @@ async function handleInstalls(request, env) {
 }
 
 /**
+ * POST /api/usage
+ *
+ * Record a template usage event such as selected or successful generation/edit.
+ */
+async function handleUsage(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const repo = canonicalizeRepo(body.repo);
+  const templateId = typeof body.template_id === "string" ? body.template_id.trim() : "";
+  const event = normalizeUsageEvent(body.event);
+  const anonymousId = normalizeAnonymousId(body.anonymous_id);
+
+  if (!repo || !repo.includes("/")) {
+    return json({ error: "invalid_repo", message: "repo is required and must contain '/'" }, 400);
+  }
+  if (!templateId) {
+    return json({ error: "invalid_template_id", message: "template_id is required" }, 400);
+  }
+  if (!event) {
+    return json({ error: "invalid_event", message: "event must be one of selected, generate_success, edit_success" }, 400);
+  }
+
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const rlKey = `usage-ratelimit:${ip}:${minuteKey()}`;
+  const rlCount = parseCount(await env.INSTALLS.get(rlKey));
+  if (rlCount >= 60) {
+    return json({ error: "rate_limited", retry_after: 60 }, 429);
+  }
+  await env.INSTALLS.put(rlKey, String(rlCount + 1), { expirationTtl: 120 });
+
+  const countKey = `usage-count:${event}:${repo}:${templateId}`;
+  const dailyKey = `usage-daily:${todayUTC()}:${event}:${repo}:${templateId}`;
+  const metadata = {
+    repo,
+    template_id: templateId,
+    event,
+    distribution: normalizeEnum(body.distribution, VALID_TEMPLATE_DISTRIBUTIONS),
+    catalog_source: normalizeEnum(body.catalog_source, VALID_CATALOG_SOURCES),
+    command: typeof body.command === "string" ? body.command.trim() : "",
+    client_ts: typeof body.client_ts === "string" ? body.client_ts.trim() : "",
+    last_seen_at: new Date().toISOString(),
+  };
+
+  await Promise.all([
+    incrementCounter(env, countKey),
+    incrementCounter(env, dailyKey, 1, { expirationTtl: 604800 }),
+    env.INSTALLS.put(`usage-meta:${event}:${repo}:${templateId}`, JSON.stringify(metadata)),
+  ]);
+
+  if (anonymousId) {
+    const uniqueMarkerKey = `usage-unique:${event}:${repo}:${templateId}:${anonymousId}`;
+    const markerExists = await env.INSTALLS.get(uniqueMarkerKey);
+    if (!markerExists) {
+      await Promise.all([
+        env.INSTALLS.put(uniqueMarkerKey, metadata.last_seen_at),
+        incrementCounter(env, `usage-unique-count:${event}:${repo}:${templateId}`),
+      ]);
+    }
+  }
+
+  return json({ ok: true });
+}
+
+/**
  * GET /api/stats?repo=...&template_id=...
  *
  * Return install counts for a repo or specific template.
  */
 async function handleStats(url, env) {
-  const repo = url.searchParams.get("repo");
+  const repo = canonicalizeRepo(url.searchParams.get("repo"));
   if (!repo) {
     return json({ error: "missing_repo", message: "repo query parameter is required" }, 400);
   }
 
   const templateId = url.searchParams.get("template_id");
+  const repoVariants = repoKeyVariants(repo);
 
   if (templateId) {
-    const raw = await env.INSTALLS.get(`count:${repo}:${templateId}`);
+    const values = await Promise.all(
+      repoVariants.map((repoVariant) => env.INSTALLS.get(`count:${repoVariant}:${templateId}`))
+    );
     return json({
       repo,
       template_id: templateId,
-      installs: raw ? parseInt(raw, 10) : 0,
+      installs: values.reduce((sum, value) => sum + parseCount(value), 0),
     });
   }
 
-  const raw = await env.INSTALLS.get(`repo-count:${repo}`);
+  const values = await Promise.all(
+    repoVariants.map((repoVariant) => env.INSTALLS.get(`repo-count:${repoVariant}`))
+  );
   return json({
     repo,
-    installs: raw ? parseInt(raw, 10) : 0,
+    installs: values.reduce((sum, value) => sum + parseCount(value), 0),
   });
+}
+
+/**
+ * GET /api/usage-stats?repo=...&template_id=...
+ *
+ * Return usage/adoption counts for a specific template.
+ */
+async function handleUsageStats(url, env) {
+  const repo = canonicalizeRepo(url.searchParams.get("repo"));
+  const templateId = url.searchParams.get("template_id");
+
+  if (!repo) {
+    return json({ error: "missing_repo", message: "repo query parameter is required" }, 400);
+  }
+  if (!templateId) {
+    return json({ error: "missing_template_id", message: "template_id query parameter is required" }, 400);
+  }
+
+  return json(await readUsageStats(env, repo, templateId));
 }
 
 /**
@@ -216,6 +524,7 @@ async function handleTrending(url, env) {
   // Scan daily: prefix keys via KV.list()
   // KV.list returns up to 1000 keys per call; page through if needed.
   const aggregated = {}; // "repo:template_id" -> total
+  const readTasks = [];
 
   let cursor = undefined;
   let done = false;
@@ -238,36 +547,24 @@ async function handleTrending(url, env) {
       const date = parts[1];
       if (!datesToInclude.has(date)) continue;
 
-      const repo = parts[2];
+      const repo = canonicalizeRepo(parts[2]);
       const templateId = parts.slice(3).join(":"); // handle template_ids with colons
       const compositeKey = `${repo}:${templateId}`;
 
-      // We need the actual value — batch reads would be ideal but KV
-      // does not support multi-get; read individually.
       if (!(compositeKey in aggregated)) {
         aggregated[compositeKey] = { repo, template_id: templateId, installs: 0 };
       }
+
+      readTasks.push({
+        compositeKey,
+        kvKey: key.name,
+      });
     }
 
     if (result.list_complete) {
       done = true;
     } else {
       cursor = result.cursor;
-    }
-  }
-
-  // Now read the actual counts for the keys we found
-  const compositeKeys = Object.keys(aggregated);
-
-  // Build a flat list of { compositeKey, dailyKvKey } for each matching date
-  const readTasks = [];
-  for (const ck of compositeKeys) {
-    const { repo, template_id } = aggregated[ck];
-    for (const date of datesToInclude) {
-      readTasks.push({
-        compositeKey: ck,
-        kvKey: `daily:${date}:${repo}:${template_id}`,
-      });
     }
   }
 
@@ -299,7 +596,7 @@ async function handleTrending(url, env) {
  */
 async function handleDiscovered(url, env) {
   const limit = clampLimit(url.searchParams.get("limit"), 200, 1000);
-  const candidates = [];
+  const candidates = new Map();
 
   let cursor = undefined;
   let done = false;
@@ -320,11 +617,13 @@ async function handleDiscovered(url, env) {
       if (!rawValue) continue;
 
       try {
-        const parsed = JSON.parse(rawValue);
+        const parsed = normalizeDiscoveredCandidate(JSON.parse(rawValue));
         if (!parsed?.repo || !parsed?.template_id) {
           continue;
         }
-        candidates.push(parsed);
+        const key = `${parsed.repo}:${parsed.template_id}`;
+        const existing = candidates.get(key);
+        candidates.set(key, existing ? mergeDiscoveredCandidates(existing, parsed) : parsed);
       } catch {
         // Ignore malformed discovered entries.
       }
@@ -337,7 +636,9 @@ async function handleDiscovered(url, env) {
     }
   }
 
-  candidates.sort((left, right) => {
+  const items = Array.from(candidates.values());
+
+  items.sort((left, right) => {
     const installsDiff = (right.install_events || 0) - (left.install_events || 0);
     if (installsDiff !== 0) {
       return installsDiff;
@@ -347,8 +648,8 @@ async function handleDiscovered(url, env) {
   });
 
   return json({
-    total: candidates.length,
-    items: candidates.slice(0, limit),
+    total: items.length,
+    items: items.slice(0, limit),
   });
 }
 
@@ -375,6 +676,16 @@ export default {
     // GET /api/stats
     if (method === "GET" && pathname === "/api/stats") {
       return handleStats(url, env);
+    }
+
+    // POST /api/usage
+    if (method === "POST" && pathname === "/api/usage") {
+      return handleUsage(request, env);
+    }
+
+    // GET /api/usage-stats
+    if (method === "GET" && pathname === "/api/usage-stats") {
+      return handleUsageStats(url, env);
     }
 
     // GET /api/trending

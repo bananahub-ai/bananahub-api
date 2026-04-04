@@ -1,6 +1,6 @@
 # bananahub-api
 
-Cloudflare Worker for BananaHub install count tracking and discovered-template intake.
+Cloudflare Worker for BananaHub install tracking, built-in template usage telemetry, and discovered-template intake.
 
 ## Endpoints
 
@@ -34,6 +34,42 @@ Query install counts.
 
 Returns `{ "repo": "...", "template_id": "...", "installs": 142 }`.
 
+### POST /api/usage
+
+Record a template adoption event.
+
+```json
+{
+  "repo": "bananahub-ai/bananahub-skill",
+  "template_id": "cute-sticker",
+  "event": "generate_success",
+  "anonymous_id": "6d7d0e4b2f7b4c48b5c0d3d5e1c2a9f4",
+  "distribution": "bundled",
+  "catalog_source": "curated",
+  "command": "generate",
+  "client_ts": "2026-04-04T12:00:00Z"
+}
+```
+
+Supported events:
+
+- `selected`
+- `generate_success`
+- `edit_success`
+
+Rate limited to 60 writes/min per IP. Returns `{ "ok": true }` on success.
+
+### GET /api/usage-stats
+
+Query usage/adoption counts for a specific template.
+
+| Parameter     | Required | Description                    |
+|---------------|----------|--------------------------------|
+| `repo`        | yes      | Repository in `owner/name` format |
+| `template_id` | yes      | Specific template to query     |
+
+Returns usage totals, 24h counts, and anonymous unique counts for `selected`, `generate_success`, and `edit_success`.
+
 ### GET /api/trending
 
 Get trending templates.
@@ -64,8 +100,13 @@ Namespace binding: `INSTALLS`
 | `count:{repo}:{template_id}`               | Per-template total   | none    |
 | `repo-count:{repo}`                        | Repo aggregate       | none    |
 | `daily:{YYYY-MM-DD}:{repo}:{template_id}`  | Trending data        | 7 days  |
+| `usage-count:{event}:{repo}:{template_id}` | Usage total          | none    |
+| `usage-daily:{YYYY-MM-DD}:{event}:{repo}:{template_id}` | Usage 24h | 7 days |
+| `usage-unique:{event}:{repo}:{template_id}:{anon}` | Unique marker | none |
+| `usage-unique-count:{event}:{repo}:{template_id}` | Unique total | none |
 | `discovered:{repo}:{template_id}`          | Discovered metadata  | none    |
-| `ratelimit:{ip}:{minute}`                  | Rate limit counter   | 120s    |
+| `ratelimit:{ip}:{minute}`                  | Install rate limit   | 120s    |
+| `usage-ratelimit:{ip}:{minute}`            | Usage rate limit     | 120s    |
 
 ## Development
 

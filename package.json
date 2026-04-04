@@ -1,7 +1,7 @@
 {
   "name": "bananahub-api",
   "version": "0.1.0",
-  "description": "Cloudflare Worker API for BananaHub install count tracking",
+  "description": "Cloudflare Worker API for BananaHub install and usage telemetry",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
