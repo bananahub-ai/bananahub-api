@@ -2,6 +2,8 @@
 
 Cloudflare Worker for BananaHub install tracking, built-in template usage telemetry, and discovered-template intake.
 
+Production base URL: **https://worker.bananahub.ai/api**
+
 ## Endpoints
 
 ### POST /api/installs
@@ -121,7 +123,7 @@ npm run dev
 npm run deploy
 ```
 
-Before deploying, update `wrangler.toml` with real KV namespace IDs:
+Before deploying, update `wrangler.toml` with real KV namespace IDs and keep the `worker.bananahub.ai` custom-domain route in sync with Cloudflare:
 ```bash
 npx wrangler kv namespace create INSTALLS
 ```

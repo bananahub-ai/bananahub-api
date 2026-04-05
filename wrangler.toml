@@ -2,6 +2,10 @@ name = "bananahub-api"
 main = "src/index.js"
 compatibility_date = "2025-03-01"
 
+[[routes]]
+pattern = "worker.bananahub.ai"
+custom_domain = true
+
 [[kv_namespaces]]
 binding = "INSTALLS"
 id = "cc55f1747c7b448caa2e4e0c648a353c"
