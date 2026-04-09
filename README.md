@@ -127,3 +127,15 @@ Before deploying, update `wrangler.toml` with real KV namespace IDs and keep the
 ```bash
 npx wrangler kv namespace create INSTALLS
 ```
+
+## Contributing
+
+Code and docs contributions to this repo are accepted under MIT. Sign off each commit with:
+
+```bash
+git commit -s -m "feat: your change"
+```
+
+## License
+
+MIT
